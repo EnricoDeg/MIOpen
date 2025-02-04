@@ -649,16 +649,27 @@ MIOpenBatchNormBwdSpatialFinalMeanVariance(__global _FLOAT* __restrict meanvarbu
     unsigned int xgid           = get_global_id(0);
     unsigned int ygrp_sz        = get_local_size(1);
     unsigned int yngrps         = get_num_groups(1);
+#if MIO_LAYOUT_NHWC
+    unsigned int cidx           = xgid;
+    unsigned int meanstashindex = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 1 * MIO_BN_C;
+    unsigned int varstashindex  = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 3 * MIO_BN_C;
+#else
     unsigned int cidx           = xgid * MIO_BN_HW;
     unsigned int meanstashindex = cidx + ygrp_sz * ygrp_id + 1;
     unsigned int varstashindex  = cidx + ygrp_sz * ygrp_id + 3;
+#endif
     unsigned int commitID       = 0;
 
     for(int gn = 0; gn < yngrps; gn++)
     {
         unsigned int offset    = gn * ygrp_sz + lid;
+#if MIO_LAYOUT_NHWC
+        unsigned int meanindex = ygrp_sz * offset * MIO_BN_C + cidx;
+        unsigned int varindex  = ygrp_sz * offset * MIO_BN_C + cidx + 2 * MIO_BN_C;
+#else
         unsigned int meanindex = cidx + ygrp_sz * offset;
         unsigned int varindex  = cidx + ygrp_sz * offset + 2;
+#endif
         if(offset < yngrps)
         { // modify to span larger number of groups
             mean += *(meanvarbuff + meanindex);
@@ -702,9 +713,15 @@ MIOpenBatchNormBwdSpatialMeanVariance(const __global _FLOAT* __restrict in,
     unsigned int ygid    = get_global_id(1);
     unsigned int ygrp_sz = get_local_size(1);
     unsigned int index;
+#if MIO_LAYOUT_NHWC
+    unsigned int cidx      = xgid;
+    unsigned int meanindex = ygrp_sz * ygrp_id * MIO_BN_C + cidx;
+    unsigned int varindex  = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 2 * MIO_BN_C;
+#else
     unsigned int cidx      = xgid * MIO_BN_HW;
     unsigned int meanindex = cidx + ygrp_sz * ygrp_id;
     unsigned int varindex  = meanindex + 2;
+#endif
     _FLOAT mean            = (_FLOAT)0.;
     _FLOAT variance        = (_FLOAT)0.;
     _FLOAT value           = (_FLOAT)0.;
@@ -714,7 +731,11 @@ MIOpenBatchNormBwdSpatialMeanVariance(const __global _FLOAT* __restrict in,
 
         for(unsigned int n = 0; n < MIO_BN_N; n++)
         {
+#if MIO_LAYOUT_NHWC
+            index = n * MIO_BN_CHW + ygid * MIO_BN_C + cidx;
+#else
             index = n * MIO_BN_CHW + cidx + ygid;
+#endif
             value = *(in + index);
             mean += value;
             variance = mad(value, value, variance);
@@ -759,7 +780,11 @@ MIOpenBatchNormBwdSpatialDScaleDBias(const __global _FLOAT* x_in,
     unsigned int ygid    = get_global_id(1);
     unsigned int ygrp_sz = get_local_size(1);
     unsigned int index;
+#if MIO_LAYOUT_NHWC
+    unsigned int cidx = xgid;
+#else
     unsigned int cidx = xgid * MIO_BN_HW;
+#endif
 
     _FLOAT mean    = (_FLOAT)0.;
     _FLOAT invVar  = (_FLOAT)0.;
@@ -773,8 +798,13 @@ MIOpenBatchNormBwdSpatialDScaleDBias(const __global _FLOAT* x_in,
     if(ylid == 0)
     {
 #if(MIO_BN_USESAVED == 0)
+#if MIO_LAYOUT_NHWC
+        unsigned int meanstashindex = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 1 * MIO_BN_C;
+        unsigned int varstashindex  = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 3 * MIO_BN_C;
+#else
         unsigned int meanstashindex = cidx + ygrp_sz * ygrp_id + 1;
         unsigned int varstashindex  = cidx + ygrp_sz * ygrp_id + 3;
+#endif
         lmean                       = *(buff + meanstashindex); // load stashed mean
         livar                       = *(buff + varstashindex);
 #else  // NO SAVED
@@ -791,7 +821,11 @@ MIOpenBatchNormBwdSpatialDScaleDBias(const __global _FLOAT* x_in,
 
         for(unsigned int n = 0; n < MIO_BN_N; n++)
         {
+#if MIO_LAYOUT_NHWC
+            index = n * MIO_BN_CHW + ygid * MIO_BN_C + cidx;
+#else
             index = n * MIO_BN_CHW + cidx + ygid;
+#endif
             dbias += *(dy_in + index);
             elemStd = *(x_in + index) - mean;
             xhat    = elemStd * invVar;
@@ -813,8 +847,13 @@ MIOpenBatchNormBwdSpatialDScaleDBias(const __global _FLOAT* x_in,
     // end reduction-----------
     if(ylid == 0)
     {
+#if MIO_LAYOUT_NHWC
+        unsigned int betaindex  = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 6 * MIO_BN_C;
+        unsigned int gammaindex = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 4 * MIO_BN_C;;
+#else
         unsigned int betaindex  = cidx + ygrp_sz * ygrp_id + 6;
         unsigned int gammaindex = cidx + ygrp_sz * ygrp_id + 4;
+#endif
         buff[gammaindex]        = FLOAT2FLOATPREC(dscale);
         buff[betaindex]         = FLOAT2FLOATPREC(dbias);
     }
@@ -834,15 +873,24 @@ MIOpenBatchNormBwdSpatialFinalDScaleDBias(__global _FLOAT* buff,
     unsigned int ygid    = get_global_id(1);
     unsigned int ygrp_sz = get_local_size(1);
     unsigned int yngrps  = get_num_groups(1);
-    int cidx             = MIO_BN_HW * xgid;
+#if MIO_LAYOUT_NHWC
+    unsigned int cidx    = xgid;
+#else
+    unsigned int cidx    = MIO_BN_HW * xgid;
+#endif
 
     for(int gn = 0; gn < MIO_BN_NGRPS; gn++)
     {
         unsigned int offset = gn * ygrp_sz + lid;
         if(offset < yngrps)
         { // modify to span larger number of groups
+#if MIO_LAYOUT_NHWC
+            unsigned int gammaindex = ygrp_sz * offset * MIO_BN_C + cidx + 4 * MIO_BN_C;
+            unsigned int betaindex  = ygrp_sz * offset * MIO_BN_C + cidx + 6 * MIO_BN_C;
+#else
             unsigned int gammaindex = cidx + ygrp_sz * offset + 4;
             unsigned int betaindex  = cidx + ygrp_sz * offset + 6;
+#endif
             ds += *(buff + gammaindex);
             db += *(buff + betaindex);
         }
@@ -881,7 +929,11 @@ MIOpenBatchNormBwdSpatialDX(const __global _FLOAT* x_in,
 
     int xgid = get_global_id(0);
     int ygid = get_global_id(1);
-    int cidx = MIO_BN_HW * xgid;
+#if MIO_LAYOUT_NHWC
+    unsigned int cidx = xgid;
+#else
+    unsigned int cidx = MIO_BN_HW * xgid;
+#endif
     unsigned int index;
     _FLOAT mean, invVar;
     _FLOAT elemStd, xhat;
@@ -897,8 +949,13 @@ MIOpenBatchNormBwdSpatialDX(const __global _FLOAT* x_in,
 #if(MIO_BN_USESAVED == 0)
         int ygrp_id                 = get_group_id(1);
         int ygrp_sz                 = get_local_size(1);
+#if MIO_LAYOUT_NHWC
+        unsigned int meanstashindex = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 1 * MIO_BN_C;
+        unsigned int varstashindex  = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 3 * MIO_BN_C;
+#else
         unsigned int meanstashindex = cidx + ygrp_sz * ygrp_id + 1;
         unsigned int varstashindex  = cidx + ygrp_sz * ygrp_id + 3;
+#endif
         lmean                       = *(dx_out + meanstashindex); // load stashed mean
         livar                       = *(dx_out + varstashindex);
 #else  // SAVED
@@ -925,7 +982,11 @@ MIOpenBatchNormBwdSpatialDX(const __global _FLOAT* x_in,
 
         for(unsigned int n = 0; n < MIO_BN_N; n++)
         { // apply normalization
+#if MIO_LAYOUT_NHWC
+            index         = n * MIO_BN_CHW + ygid * MIO_BN_C + cidx;
+#else
             index         = n * MIO_BN_CHW + cidx + ygid;
+#endif
             elemStd       = *(x_in + index) - mean; // (x_i - mean)
             xhat          = elemStd * invVar;       // recalculating this again...
             tmp1          = mad(NHW, *(dy_in + index), -dbias);

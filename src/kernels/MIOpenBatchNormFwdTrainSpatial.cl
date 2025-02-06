@@ -439,6 +439,48 @@ MIOpenBatchNormFwdTrainSpatial(const __global _FLOAT* __restrict in,
 
 #elif(MIO_BN_VARIANT == 2) // MULTI-KERNEL reduction for > 33M elements
 
+#if MIO_LAYOUT_NHWC
+// NHWC is using an extra buffer, so there is no need for shared memory in this kernel
+__attribute__((reqd_work_group_size(MIO_BN_K2_GRP0, MIO_BN_K2_GRP1, MIO_BN_K2_GRP2))) __kernel void
+MIOpenBatchNormFwdTrainSpatialNorm(const __global _FLOAT* __restrict in,
+                                   __global _FLOAT* __restrict out,
+                                   const __global _FLOAT* __restrict buffer,
+                                   const __global _FLOAT_PREC* __restrict scale,
+                                   const __global _FLOAT_PREC* __restrict bias)
+{
+
+    // SPATIAL
+    _FLOAT_PREC mean        = (_FLOAT_PREC)0.;
+    _FLOAT_PREC invVariance = (_FLOAT_PREC)0.;
+    _FLOAT_PREC inhat       = (_FLOAT_PREC)0.;
+    _FLOAT_PREC pvt_scale   = (_FLOAT_PREC)0.;
+    _FLOAT_PREC pvt_bias    = (_FLOAT_PREC)0.;
+
+    unsigned int xgid    = get_global_id(0);
+    unsigned int ygid    = get_global_id(1);
+    unsigned int index;
+
+    // #4 apply the normalization :: x_hat = (x_i - mean) / sqrt(variance_accum + epsilon)
+    if(ygid < MIO_BN_HW && xgid < MIO_BN_C)
+    {
+        mean        = FLOAT2FLOATPREC(*(buffer + xgid));
+        invVariance = FLOAT2FLOATPREC(*(buffer + xgid + MIO_BN_C));
+        pvt_scale   = *(scale + xgid);
+        pvt_bias    = *(bias + xgid);
+#if(MIO_BN_HW > MIO_BN_LOOP_UNROLL_MAXHW)
+        for(unsigned int n = 0; n < MIO_BN_N; n++)
+#else
+        __attribute__((opencl_unroll_hint(2))) for(unsigned int n = 0; n < MIO_BN_N; n++)
+#endif
+        { // apply normalization
+            index = n * MIO_BN_CHW + ygid * MIO_BN_C + xgid;
+            inhat = (FLOAT2FLOATPREC(*(in + index)) - mean) * invVariance;
+            // #5 Gamma and Beta adjust :: y_i = gamma*x_hat + beta
+            out[index] = FLOATPREC2FLOAT(mad(pvt_scale, inhat, pvt_bias));
+        } // end for(n)
+    }     // end if(inImgIndex)
+} // end spatial norm
+#else
 __attribute__((reqd_work_group_size(MIO_BN_GRP0, MIO_BN_GRP1, MIO_BN_GRP2))) __kernel void
 MIOpenBatchNormFwdTrainSpatialNorm(const __global _FLOAT* __restrict in,
                                    __global _FLOAT* __restrict out,
@@ -461,16 +503,9 @@ MIOpenBatchNormFwdTrainSpatialNorm(const __global _FLOAT* __restrict in,
     unsigned int ygid    = get_global_id(1);
     unsigned int ygrp_sz = get_local_size(1);
     unsigned int index;
-
-#if MIO_LAYOUT_NHWC
-    unsigned int cidx           = xgid;
-    unsigned int meanstashindex = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 1 * MIO_BN_C;
-    unsigned int varstashindex  = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 3 * MIO_BN_C;
-#else
     unsigned int cidx           = xgid * MIO_BN_HW;
     unsigned int meanstashindex = cidx + ygrp_sz * ygrp_id + 1;
     unsigned int varstashindex  = cidx + ygrp_sz * ygrp_id + 3;
-#endif
 
     // #4 apply the normalization :: x_hat = (x_i - mean) / sqrt(variance_accum + epsilon)
     if(get_local_id(1) == 0)
@@ -494,21 +529,122 @@ MIOpenBatchNormFwdTrainSpatialNorm(const __global _FLOAT* __restrict in,
         __attribute__((opencl_unroll_hint(2))) for(unsigned int n = 0; n < MIO_BN_N; n++)
 #endif
         { // apply normalization
-#if MIO_LAYOUT_NHWC
-            index = n * MIO_BN_CHW + ygid * MIO_BN_C + cidx;
-#else
             index = n * MIO_BN_CHW + cidx + ygid;
-#endif
             inhat = (FLOAT2FLOATPREC(*(in + index)) - mean) * invVariance;
             // #5 Gamma and Beta adjust :: y_i = gamma*x_hat + beta
             out[index] = FLOATPREC2FLOAT(mad(pvt_scale, inhat, pvt_bias));
         } // end for(n)
     }     // end if(inImgIndex)
 } // end spatial norm
+#endif
 
+#if MIO_LAYOUT_NHWC
+__attribute__((reqd_work_group_size(MIO_BN_K0_GRP0, MIO_BN_K0_GRP1, MIO_BN_K0_GRP2))) __kernel void
+MIOpenBatchNormFwdTrainSpatialFinalMeanVariance(
+    __global _FLOAT* __restrict meanvarbuff,
+    __global _FLOAT* __restrict buffer,
+    _FLOAT_PREC INHW
+#if(MIO_RUNNING_RESULT == 1)
+    ,
+    double expAvgFactor /* input momentum */
+    ,
+    __global _FLOAT_PREC* __restrict resultRunningMean, /*input and output*/
+    __global _FLOAT_PREC* __restrict resultRunningVariance
+#endif
+    ,
+    double epsilon
+#if(MIO_SAVE_MEAN_VARIANCE == 1)
+    ,
+    __global _FLOAT_PREC* __restrict resultSaveMean /*output only*/
+    ,
+    __global _FLOAT_PREC* __restrict resultSaveInvVariance
+#endif
+)
+{
+    _FLOAT_PREC variance        = (_FLOAT_PREC)0.;
+    _FLOAT_PREC invVariance     = (_FLOAT_PREC)0.;
+    _FLOAT_PREC mean            = (_FLOAT_PREC)0.;
+    unsigned int lid            = get_local_id(1);
+    unsigned int ygrp_id        = get_group_id(1);
+    unsigned int xgid           = get_global_id(0);
+    unsigned int ygrp_sz        = get_local_size(1);
+    unsigned int yngrps         = MIO_BN_HW / ygrp_sz;
+    uint ygid  = get_global_id(1);
+    uint lid0   = get_local_id(0);
+    uint lid1   = get_local_id(1);
+    uint grpid0 = get_group_id(0);
+    uint grpid1 = get_group_id(1);
+    uint grpsz0 = get_local_size(0);
+    uint grpsz1 = get_local_size(1);
+    unsigned int cidx           = xgid;
+    unsigned int meanstashindex;
+    unsigned int varstashindex ;
+    unsigned int commitID       = 0;
+
+    for(int gn = 0; gn < yngrps / ygrp_sz + 1; gn++)
+    {
+        unsigned int offset    = gn * ygrp_sz + lid;
+        unsigned int meanindex = offset * MIO_BN_C + xgid;
+        unsigned int varindex  = yngrps * MIO_BN_C + offset * MIO_BN_C + xgid;
+        if(offset < yngrps)
+        { // modify to span larger number of groups
+            mean += FLOAT2FLOATPREC(*(meanvarbuff + meanindex));
+            variance += FLOAT2FLOATPREC(*(meanvarbuff + varindex)); // load per group variance
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    local _FLOAT_ACCUM lcl_data_x[MIO_BN_LDS_SIZE];
+    local _FLOAT_ACCUM lcl_data_y[MIO_BN_LDS_SIZE];
+
+    unsigned int idsh = lid1 * grpsz0 + lid0;
+    lcl_data_x[idsh] = mean;
+    lcl_data_y[idsh] = variance;
+
+    for (unsigned int s=grpsz1 / 2; s>0; s>>=1) {
+        if (lid1 < s) {
+            unsigned int id1 = lid1 * grpsz0 + lid0;
+            unsigned int id2 = (lid1 + s) * grpsz0 + lid0;
+            lcl_data_x[id1] += lcl_data_x[id2];
+            lcl_data_y[id1] += lcl_data_y[id2];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    if(lid1 == 0 && get_group_id(1) == 0)
+    {
+        mean     = lcl_data_x[lid0] * (_FLOAT_ACCUM)INHW;
+        variance = lcl_data_y[lid0] * (_FLOAT_ACCUM)INHW;
+        variance = mad(-mean, mean, variance);
+        if(variance < 0)
+        {
+            variance = 0;
+        }
+        invVariance = rsqrt(variance + epsilon);
+
+        meanstashindex = xgid;
+        varstashindex  = xgid + MIO_BN_C;
+        buffer[meanstashindex] = FLOATPREC2FLOAT(mean);        // stash mean
+        buffer[varstashindex]  = FLOATPREC2FLOAT(invVariance); // stash variance
+
+        // Save mean and calculate and save running mean
+#if(MIO_RUNNING_RESULT == 1)
+        running_stash(resultRunningMean, resultRunningVariance, expAvgFactor, mean, variance, xgid);
+#endif
+
+#if(MIO_SAVE_MEAN_VARIANCE == 1)
+        saved_stash(resultSaveMean, resultSaveInvVariance, mean, invVariance, xgid);
+#endif
+    }
+}
+#else // MIO_LAYOUT_NHWC
 __attribute__((reqd_work_group_size(MIO_BN_GRP0, MIO_BN_GRP1, MIO_BN_GRP2))) __kernel void
 MIOpenBatchNormFwdTrainSpatialFinalMeanVariance(
     __global _FLOAT* __restrict meanvarbuff,
+    __global _FLOAT* __restrict buffer,
     _FLOAT_PREC INHW
 #if(MIO_RUNNING_RESULT == 1)
     ,
@@ -581,11 +717,24 @@ MIOpenBatchNormFwdTrainSpatialFinalMeanVariance(
         variance = 0;
     }
     invVariance = rsqrt(variance + epsilon);
+
+#if MIO_LAYOUT_NHWC
+    // NHWC is using an extra buffer of size 2 * c to be able to have better memory access
+    // in the next kernel when the normalization is computed and stored on the output
+    if(lid == commitID && get_group_id(1) == 0)
+    {
+        meanstashindex = cidx;
+        varstashindex  = cidx + MIO_BN_C;
+        buffer[meanstashindex] = FLOATPREC2FLOAT(mean);        // stash mean
+        buffer[varstashindex]  = FLOATPREC2FLOAT(invVariance); // stash variance
+    }
+#else
     if(lid == commitID)
     {
         meanvarbuff[meanstashindex] = FLOATPREC2FLOAT(mean);        // stash mean
         meanvarbuff[varstashindex]  = FLOATPREC2FLOAT(invVariance); // stash mean
     }
+#endif
 
     // Save mean and calculate and save running mean
     unsigned int ygid = get_global_id(1);
@@ -600,7 +749,63 @@ MIOpenBatchNormFwdTrainSpatialFinalMeanVariance(
 #endif
     }
 }
+#endif
 
+#if MIO_LAYOUT_NHWC
+__attribute__((reqd_work_group_size(MIO_BN_K0_GRP0, MIO_BN_K0_GRP1, MIO_BN_K0_GRP2))) __kernel void
+MIOpenBatchNormFwdTrainSpatialMeanVariance(const __global _FLOAT* __restrict in,
+                                           __global _FLOAT* __restrict mvbuff)
+{
+
+    uint index = 0;
+    uint xgid  = get_global_id(0);
+    uint ygid  = get_global_id(1);
+    uint lid0   = get_local_id(0);
+    uint lid1   = get_local_id(1);
+    uint grpid0 = get_group_id(0);
+    uint grpid1 = get_group_id(1);
+    uint grpsz0 = get_local_size(0);
+    uint grpsz1 = get_local_size(1);
+    unsigned int yngrps         = get_num_groups(1);
+    _FLOAT_ACCUM mean      = (_FLOAT_ACCUM)0.;
+    _FLOAT_ACCUM variance  = (_FLOAT_ACCUM)0.;
+    _FLOAT_ACCUM value     = (_FLOAT_ACCUM)0.;
+
+    if (xgid < MIO_BN_C && ygid < MIO_BN_HW) {
+        for(unsigned int n = 0; n < MIO_BN_N; n++)
+        {
+            index = n * MIO_BN_CHW + ygid * MIO_BN_C + xgid;
+            _FLOAT_PREC xin = FLOAT2FLOATPREC(*(in + index));
+            mean += xin;
+            variance = mad(xin, xin, variance);
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    local _FLOAT_ACCUM lcl_data_x[MIO_BN_LDS_SIZE];
+    local _FLOAT_ACCUM lcl_data_y[MIO_BN_LDS_SIZE];
+
+    unsigned int idsh = lid1 * grpsz0 + lid0;
+    lcl_data_x[idsh] = mean;
+    lcl_data_y[idsh] = variance;
+
+    for (unsigned int s=grpsz1 / 2; s>0; s>>=1) {
+        if (lid1 < s) {
+            unsigned int id1 = lid1 * grpsz0 + lid0;
+            unsigned int id2 = (lid1 + s) * grpsz0 + lid0;
+            lcl_data_x[id1] += lcl_data_x[id2];
+            lcl_data_y[id1] += lcl_data_y[id2];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid1 == 0) {
+        mvbuff[grpid1 * MIO_BN_C + xgid] = lcl_data_x[lid0];
+        mvbuff[yngrps * MIO_BN_C + grpid1 * MIO_BN_C + xgid] = lcl_data_y[lid0];
+    }
+} // end spatial mean kernel
+#else // if MIO_LAYOUT_NHWC
 __attribute__((reqd_work_group_size(MIO_BN_GRP0, MIO_BN_GRP1, MIO_BN_GRP2))) __kernel void
 MIOpenBatchNormFwdTrainSpatialMeanVariance(const __global _FLOAT* __restrict in,
                                            __global _FLOAT* __restrict mvbuff)
@@ -660,6 +865,7 @@ MIOpenBatchNormFwdTrainSpatialMeanVariance(const __global _FLOAT* __restrict in,
         mvbuff[varindex]  = ACCUM2FLOAT(variance);
     }
 } // end spatial mean kernel
+#endif
 
 #elif(MIO_BN_VARIANT == 3)
 

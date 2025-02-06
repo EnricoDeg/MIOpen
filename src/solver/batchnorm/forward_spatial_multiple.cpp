@@ -195,6 +195,33 @@ ConvSolution BnFwdTrainingSpatialMultiple::GetSolution(
         size_t zlocalsize = 1;
         size_t zgridsize  = 1;
 
+        size_t xlocalsize_k0 = xlocalsize;
+        size_t ylocalsize_k0 = ylocalsize;
+        size_t xgridsize_k0  = xgridsize;
+        size_t ygridsize_k0  = ygridsize;
+        size_t xlocalsize_k1 = xlocalsize;
+        size_t ylocalsize_k1 = ylocalsize;
+        size_t xgridsize_k1  = xgridsize;
+        size_t ygridsize_k1  = ygridsize;
+        size_t xlocalsize_k2 = xlocalsize;
+        size_t ylocalsize_k2 = ylocalsize;
+        size_t xgridsize_k2  = xgridsize;
+        size_t ygridsize_k2  = ygridsize;
+        if (xDesc.GetLayout_t() == miopenTensorNHWC) {
+            xlocalsize_k0 = 64;
+            ylocalsize_k0 = 16;
+            xgridsize_k0  = xlocalsize_k0 * ((c + xlocalsize_k0 - 1) / xlocalsize_k0);
+            ygridsize_k0  = ylocalsize_k0 * ((in_cstride + ylocalsize_k0 - 1) / ylocalsize_k0);
+            xlocalsize_k1 = 64;
+            ylocalsize_k1 = 16;
+            xgridsize_k1  = xlocalsize_k1 * ((c + xlocalsize_k1 - 1) / xlocalsize_k1);
+            ygridsize_k1  = ylocalsize_k1;
+            xlocalsize_k2 = 256;
+            ylocalsize_k2 = 1;
+            xgridsize_k2  = xlocalsize_k2 * ((c + xlocalsize_k2 - 1) / xlocalsize_k2);
+            ygridsize_k2  = ylocalsize_k2 * ((in_cstride + ylocalsize_k2 - 1) / ylocalsize_k2);
+        }
+
         auto build_params = KernelBuildParameters{
             {"MIOPEN_USE_FP16", static_cast<int>(bfp16parm)},
             {"MIOPEN_USE_FP32", static_cast<int>(bfp32parm)},
@@ -215,6 +242,12 @@ ConvSolution BnFwdTrainingSpatialMultiple::GetSolution(
             {"MIO_BN_GRP0", xlocalsize},
             {"MIO_BN_GRP1", ylocalsize},
             {"MIO_BN_GRP2", zlocalsize},
+            {"MIO_BN_K0_GRP0", xlocalsize_k0},
+            {"MIO_BN_K0_GRP1", ylocalsize_k0},
+            {"MIO_BN_K0_GRP2", zlocalsize},
+            {"MIO_BN_K2_GRP0", xlocalsize_k2},
+            {"MIO_BN_K2_GRP1", ylocalsize_k2},
+            {"MIO_BN_K2_GRP2", zlocalsize},
             {"MIO_BN_GFX103X", (StartsWith(handle.GetDeviceName(), "gfx103") ? "1" : "0")},
             {"MIO_BN_GFX110X", (StartsWith(handle.GetDeviceName(), "gfx110") ? "1" : "0")},
             {"MIO_BN_GFX120X", (StartsWith(handle.GetDeviceName(), "gfx120") ? "1" : "0")},
@@ -233,12 +266,24 @@ ConvSolution BnFwdTrainingSpatialMultiple::GetSolution(
 
         auto copy        = kernel;
         copy.kernel_name = kernel.kernel_name + "MeanVariance";
+        copy.l_wk[0] = xlocalsize_k0;
+        copy.l_wk[1] = ylocalsize_k0;
+        copy.g_wk[0] = xgridsize_k0;
+        copy.g_wk[1] = ygridsize_k0;
         result.construction_params.push_back(copy);
 
         copy.kernel_name = kernel.kernel_name + "FinalMeanVariance";
+        copy.l_wk[0] = xlocalsize_k1;
+        copy.l_wk[1] = ylocalsize_k1;
+        copy.g_wk[0] = xgridsize_k1;
+        copy.g_wk[1] = ygridsize_k1;
         result.construction_params.push_back(copy);
 
         copy.kernel_name = kernel.kernel_name + "Norm";
+        copy.l_wk[0] = xlocalsize_k2;
+        copy.l_wk[1] = ylocalsize_k2;
+        copy.g_wk[0] = xgridsize_k2;
+        copy.g_wk[1] = ygridsize_k2;
         result.construction_params.push_back(copy);
     }
 
@@ -253,14 +298,18 @@ ConvSolution BnFwdTrainingSpatialMultiple::GetSolution(
             const auto resultrunning =
                 params.resultRunningMean != nullptr && params.resultRunningVariance != nullptr;
 
+            float * buffer = nullptr;
             float ctime = 0.;
             visit_float(dtype, [&](auto as_float) {
+                hipMalloc(&buffer, 2UL * c * sizeof(float));
+
                 handle_.Run(kernels[0])(params.x, params.y);
                 profileSequence(handle_, 0, &ctime);
 
                 if(resultsave && resultrunning)
                 {
                     handle_.Run(kernels[1])(params.y,
+                                            buffer,
                                             as_float(inhw),
                                             params.expAvgFactor,
                                             params.resultRunningMean,
@@ -272,6 +321,7 @@ ConvSolution BnFwdTrainingSpatialMultiple::GetSolution(
                 else if(resultsave)
                 {
                     handle_.Run(kernels[1])(params.y,
+                                            buffer,
                                             as_float(inhw),
                                             params.epsilon,
                                             params.resultSaveMean,
@@ -280,6 +330,7 @@ ConvSolution BnFwdTrainingSpatialMultiple::GetSolution(
                 else if(resultrunning)
                 {
                     handle_.Run(kernels[1])(params.y,
+                                            buffer,
                                             as_float(inhw),
                                             params.expAvgFactor,
                                             params.resultRunningMean,
@@ -288,13 +339,18 @@ ConvSolution BnFwdTrainingSpatialMultiple::GetSolution(
                 }
                 else
                 {
-                    handle_.Run(kernels[1])(params.y, as_float(inhw), params.epsilon);
+                    handle_.Run(kernels[1])(params.y, buffer, as_float(inhw), params.epsilon);
                 }
 
                 profileSequence(handle_, 1, &ctime);
 
-                handle_.Run(kernels[2])(params.x, params.y, params.bnScale, params.bnBias);
+                if (xDesc.GetLayout_t() == miopenTensorNHWC)
+                    handle_.Run(kernels[2])(params.x, params.y, buffer, params.bnScale, params.bnBias);
+                else
+                    handle_.Run(kernels[2])(params.x, params.y, params.bnScale, params.bnBias);
                 profileSequence(handle_, 2, &ctime);
+
+                hipFree(buffer);
             });
         };
     };

@@ -561,29 +561,21 @@ MIOpenBatchNormFwdTrainSpatialFinalMeanVariance(
 #endif
 )
 {
-    _FLOAT_PREC variance        = (_FLOAT_PREC)0.;
-    _FLOAT_PREC invVariance     = (_FLOAT_PREC)0.;
-    _FLOAT_PREC mean            = (_FLOAT_PREC)0.;
-    unsigned int lid            = get_local_id(1);
-    unsigned int ygrp_id        = get_group_id(1);
-    unsigned int xgid           = get_global_id(0);
-    unsigned int ygrp_sz        = get_local_size(1);
-    unsigned int yngrps         = MIO_BN_HW / ygrp_sz;
-    uint ygid  = get_global_id(1);
-    uint lid0   = get_local_id(0);
-    uint lid1   = get_local_id(1);
-    uint grpid0 = get_group_id(0);
-    uint grpid1 = get_group_id(1);
-    uint grpsz0 = get_local_size(0);
-    uint grpsz1 = get_local_size(1);
-    unsigned int cidx           = xgid;
+    _FLOAT_PREC variance    = (_FLOAT_PREC)0.;
+    _FLOAT_PREC invVariance = (_FLOAT_PREC)0.;
+    _FLOAT_PREC mean        = (_FLOAT_PREC)0.;
+    unsigned int xgid       = get_global_id(0);
+    unsigned int lid0       = get_local_id(0);
+    unsigned int lid1       = get_local_id(1);
+    unsigned int grpsz0     = get_local_size(0);
+    unsigned int grpsz1     = get_local_size(1);
+    unsigned int yngrps     = MIO_BN_HW / grpsz1;
     unsigned int meanstashindex;
     unsigned int varstashindex ;
-    unsigned int commitID       = 0;
 
-    for(int gn = 0; gn < yngrps / ygrp_sz + 1; gn++)
+    for(int gn = 0; gn < yngrps / grpsz1 + 1; gn++)
     {
-        unsigned int offset    = gn * ygrp_sz + lid;
+        unsigned int offset    = gn * grpsz1 + lid1;
         unsigned int meanindex = offset * MIO_BN_C + xgid;
         unsigned int varindex  = yngrps * MIO_BN_C + offset * MIO_BN_C + xgid;
         if(offset < yngrps)
@@ -671,27 +663,16 @@ MIOpenBatchNormFwdTrainSpatialFinalMeanVariance(
     unsigned int xgid           = get_global_id(0);
     unsigned int ygrp_sz        = get_local_size(1);
     unsigned int yngrps         = get_num_groups(1);
-#if MIO_LAYOUT_NHWC
-    unsigned int cidx           = xgid;
-    unsigned int meanstashindex = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 1 * MIO_BN_C;
-    unsigned int varstashindex  = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 3 * MIO_BN_C;
-#else
     unsigned int cidx           = xgid * MIO_BN_HW;
     unsigned int meanstashindex = cidx + ygrp_sz * ygrp_id + 1;
     unsigned int varstashindex  = cidx + ygrp_sz * ygrp_id + 3;
-#endif
     unsigned int commitID       = 0;
 
     for(int gn = 0; gn < yngrps; gn++)
     {
         unsigned int offset    = gn * ygrp_sz + lid;
-#if MIO_LAYOUT_NHWC
-        unsigned int meanindex = ygrp_sz * offset * MIO_BN_C + cidx;
-        unsigned int varindex  = ygrp_sz * offset * MIO_BN_C + cidx + 2 * MIO_BN_C;
-#else
         unsigned int meanindex = cidx + ygrp_sz * offset;
         unsigned int varindex  = cidx + ygrp_sz * offset + 2;
-#endif
         if(offset < yngrps)
         { // modify to span larger number of groups
             mean += FLOAT2FLOATPREC(*(meanvarbuff + meanindex));
@@ -718,23 +699,11 @@ MIOpenBatchNormFwdTrainSpatialFinalMeanVariance(
     }
     invVariance = rsqrt(variance + epsilon);
 
-#if MIO_LAYOUT_NHWC
-    // NHWC is using an extra buffer of size 2 * c to be able to have better memory access
-    // in the next kernel when the normalization is computed and stored on the output
-    if(lid == commitID && get_group_id(1) == 0)
-    {
-        meanstashindex = cidx;
-        varstashindex  = cidx + MIO_BN_C;
-        buffer[meanstashindex] = FLOATPREC2FLOAT(mean);        // stash mean
-        buffer[varstashindex]  = FLOATPREC2FLOAT(invVariance); // stash variance
-    }
-#else
     if(lid == commitID)
     {
         meanvarbuff[meanstashindex] = FLOATPREC2FLOAT(mean);        // stash mean
         meanvarbuff[varstashindex]  = FLOATPREC2FLOAT(invVariance); // stash mean
     }
-#endif
 
     // Save mean and calculate and save running mean
     unsigned int ygid = get_global_id(1);
@@ -757,16 +726,15 @@ MIOpenBatchNormFwdTrainSpatialMeanVariance(const __global _FLOAT* __restrict in,
                                            __global _FLOAT* __restrict mvbuff)
 {
 
-    uint index = 0;
-    uint xgid  = get_global_id(0);
-    uint ygid  = get_global_id(1);
-    uint lid0   = get_local_id(0);
-    uint lid1   = get_local_id(1);
-    uint grpid0 = get_group_id(0);
-    uint grpid1 = get_group_id(1);
-    uint grpsz0 = get_local_size(0);
-    uint grpsz1 = get_local_size(1);
-    unsigned int yngrps         = get_num_groups(1);
+    unsigned int index;
+    unsigned int xgid      = get_global_id(0);
+    unsigned int ygid      = get_global_id(1);
+    unsigned int lid0      = get_local_id(0);
+    unsigned int lid1      = get_local_id(1);
+    unsigned int grpid1    = get_group_id(1);
+    unsigned int grpsz0    = get_local_size(0);
+    unsigned int grpsz1    = get_local_size(1);
+    unsigned int yngrps    = get_num_groups(1);
     _FLOAT_ACCUM mean      = (_FLOAT_ACCUM)0.;
     _FLOAT_ACCUM variance  = (_FLOAT_ACCUM)0.;
     _FLOAT_ACCUM value     = (_FLOAT_ACCUM)0.;
@@ -817,15 +785,9 @@ MIOpenBatchNormFwdTrainSpatialMeanVariance(const __global _FLOAT* __restrict in,
     unsigned int ygid    = get_global_id(1);
     unsigned int ygrp_sz = get_local_size(1);
     unsigned int index;
-#if MIO_LAYOUT_NHWC
-    unsigned int cidx      = xgid;
-    unsigned int meanindex = ygrp_sz * ygrp_id * MIO_BN_C + cidx;
-    unsigned int varindex  = ygrp_sz * ygrp_id * MIO_BN_C + cidx + 2 * MIO_BN_C;
-#else
     unsigned int cidx      = xgid * MIO_BN_HW;
     unsigned int meanindex = cidx + ygrp_sz * ygrp_id;
     unsigned int varindex  = meanindex + 2;
-#endif
     _FLOAT_ACCUM mean      = (_FLOAT_ACCUM)0.;
     _FLOAT_ACCUM variance  = (_FLOAT_ACCUM)0.;
     _FLOAT_ACCUM value     = (_FLOAT_ACCUM)0.;
@@ -838,11 +800,7 @@ MIOpenBatchNormFwdTrainSpatialMeanVariance(const __global _FLOAT* __restrict in,
         __attribute__((opencl_unroll_hint(2))) for(unsigned int n = 0; n < MIO_BN_N; n++)
 #endif
         {
-#if MIO_LAYOUT_NHWC
-            index = n * MIO_BN_CHW + ygid * MIO_BN_C + cidx;
-#else
             index = n * MIO_BN_CHW + cidx + ygid;
-#endif
             value = FLOAT2ACCUM(*(in + index));
             mean += value;
             variance = mad(value, value, variance);
